@@ -1,0 +1,281 @@
+<!doctype html>
+<!--
+  BLE 画像受け取りページ (Android Chrome の Web Bluetooth)。
+  ble_share.exe が出す QR から開く: receive.html#u=<サービス UUID>&k=<鍵 base64url>
+  # 以降はページの配信元に送られないので、配信元には鍵も画像も渡らない。
+  Web Bluetooth は secure context 必須 (https か localhost)。
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>画像の受け取り</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1d2330; --sub:#5b6474; --accent:#2a6df4; --card:#fff; --line:#e1e4ea; --err:#c0392b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171c; --fg:#e8ebf0; --sub:#9aa3b2; --accent:#5b8ff9; --card:#1e232b; --line:#2c323c; --err:#ff7b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  h1 { font-size:20px; margin:8px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  button { width:100%; padding:14px; font-size:17px; border:0; border-radius:10px; background:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; }
+  .status { color:var(--sub); font-size:14px; margin-top:12px; min-height:1.4em; }
+  .status.err { color:var(--err); }
+  progress { width:100%; height:10px; margin-top:12px; }
+  .item img { width:100%; border-radius:8px; display:block; background:#000; }
+  .item .name { font-size:13px; color:var(--sub); margin:8px 0; word-break:break-all; }
+  .row { display:flex; gap:8px; }
+  .row a, .row button { flex:1; text-align:center; padding:10px; font-size:15px; border-radius:8px;
+                        background:transparent; color:var(--accent); border:1px solid var(--accent); text-decoration:none; }
+</style>
+</head>
+<body>
+<h1>画像の受け取り</h1>
+<div class="card">
+  <button id="go">受け取る</button>
+  <progress id="bar" max="1" value="0" hidden></progress>
+  <div id="status" class="status">PC の近くで「受け取る」を押し、表示された機器を選んでください。</div>
+</div>
+<div id="out"></div>
+
+<script>
+const INFO = '7a1c0001-5b2e-4f8a-9c3d-2e6f1b0a9d41';
+const DATA = '7a1c0002-5b2e-4f8a-9c3d-2e6f1b0a9d41';
+const CTRL = '7a1c0003-5b2e-4f8a-9c3d-2e6f1b0a9d41';
+
+const $ = id => document.getElementById(id);
+const setStatus = (msg, err = false) => { $('status').textContent = msg; $('status').classList.toggle('err', err); };
+
+const params = new URLSearchParams(location.hash.slice(1));
+const serviceUuid = (params.get('u') || '').toLowerCase();
+const keyB64 = params.get('k') || '';
+// 鍵をアドレスバーと履歴に残さない
+try { history.replaceState(null, '', location.pathname); } catch (e) {}
+
+if (!navigator.bluetooth) {
+  $('go').disabled = true;
+  setStatus('このブラウザは Web Bluetooth に対応していません (Android の Chrome で開いてください)。', true);
+} else if (!serviceUuid || !keyB64) {
+  $('go').disabled = true;
+  setStatus('QR の情報が足りません。PC に表示された QR から開き直してください。', true);
+}
+
+function b64urlDecode(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+
+function cmd(op, offset) {
+  const b = new Uint8Array(5);
+  b[0] = op;
+  new DataView(b.buffer).setUint32(1, offset, true);
+  return b;
+}
+
+// CTRL への書き込みは同時に 1 つしか出せない (GATT operation already in progress になる)。
+// start / done は応答ありで順番に、ack は応答なしで最新の 1 つだけ送る
+function makeCtrlWriter(ctrl) {
+  const queue = [];
+  let ack = null, busy = false;
+  function pump() {
+    if (busy) return;
+    let p;
+    if (queue.length) {
+      const { bytes, resolve, reject } = queue.shift();
+      p = ctrl.writeValueWithResponse(bytes).then(resolve, reject);
+    } else if (ack !== null) {
+      p = ctrl.writeValueWithoutResponse(cmd(0x03, ack)).catch(() => {});
+      ack = null;
+    } else {
+      return;
+    }
+    busy = true;
+    p.finally(() => { busy = false; pump(); });
+  }
+  return {
+    send(bytes) { return new Promise((resolve, reject) => { queue.push({ bytes, resolve, reject }); pump(); }); },
+    ack(offset) { ack = offset; pump(); },
+  };
+}
+
+async function decrypt(payload) {
+  const key = await crypto.subtle.importKey('raw', b64urlDecode(keyB64), 'AES-GCM', false, ['decrypt']);
+  const iv = payload.subarray(0, 12);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, payload.subarray(12));
+  return new Uint8Array(plain);
+}
+
+function parseFiles(plain) {
+  const files = [];
+  const dv = new DataView(plain.buffer, plain.byteOffset, plain.byteLength);
+  let p = 0;
+  while (p < plain.length) {
+    const jlen = dv.getUint32(p, true); p += 4;
+    const meta = JSON.parse(new TextDecoder().decode(plain.subarray(p, p + jlen))); p += jlen;
+    const data = plain.slice(p, p + meta.size); p += meta.size;
+    files.push(new File([data], meta.name, { type: meta.type }));
+  }
+  return files;
+}
+
+function show(files) {
+  for (const f of files) {
+    const url = URL.createObjectURL(f);
+    const div = document.createElement('div');
+    div.className = 'card item';
+    div.innerHTML = `<img alt=""><div class="name"></div><div class="row"><a>保存</a></div>`;
+    div.querySelector('img').src = url;
+    div.querySelector('.name').textContent = f.name;
+    const a = div.querySelector('a');
+    a.href = url; a.download = f.name;
+    if (navigator.canShare && navigator.canShare({ files: [f] })) {
+      const b = document.createElement('button');
+      b.textContent = '共有';
+      b.onclick = () => navigator.share({ files: [f] }).catch(() => {});
+      div.querySelector('.row').append(b);
+    }
+    $('out').append(div);
+  }
+}
+
+$('go').onclick = async () => {
+  $('go').disabled = true;
+  let device;
+  let step = '機器の選択';   // 失敗したときにどこで止まったかを出す
+  let diagFn = null;
+  try {
+    setStatus('機器を探しています…');
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [serviceUuid] }] });
+
+    // 接続をまたいで持つ受信状態
+    let buf = null, total = 0, expected = 0, t0 = 0;
+    let resends = 0, writeErrors = 0, reconnects = 0;
+    // 診断用: 届いた notify の数と、最初・最後のオフセットと長さ
+    let notifies = 0, firstOff = -1, lastOff = -1, lastLen = 0;
+    diagFn = () => `通知 ${notifies} 個 (最初 ${firstOff}, 最後 ${lastOff} / ${lastLen}B), 受信済み ${expected} B, 再送要求 ${resends}, 書き込み失敗 ${writeErrors}, 再接続 ${reconnects}`;
+
+    // 1 回の接続で最後まで受ける。全部受けたら CTRL の writer を返す。
+    // Windows の notify は一度詰まると同じ接続では戻らないことがあるので、
+    // 5 秒進まなければ 'stall' で抜けて、呼び出し側で接続し直す
+    const receiveOnce = async () => {
+      step = '接続';
+      setStatus(reconnects ? `接続し直しています… (${reconnects} 回目)` : '接続しています…');
+      const server = await device.gatt.connect();
+      step = 'サービス取得';
+      const svc = await server.getPrimaryService(serviceUuid);
+      if (!buf) {
+        step = 'INFO 読み出し';
+        const info = await (await svc.getCharacteristic(INFO)).readValue();
+        total = info.getUint32(4, true);
+        buf = new Uint8Array(total);
+        t0 = performance.now();
+        $('bar').hidden = false;
+      }
+      const data = await svc.getCharacteristic(DATA);
+      const ctrl = await svc.getCharacteristic(CTRL);
+      const writer = makeCtrlWriter(ctrl);
+
+      let resendAt = -1;      // 再送要求を出した位置 (同じ欠けで何度も要求しない)
+      let sinceAck = 0;
+      // 受信中の書き込みは混んでいると失敗することがある (Android 側の送信待ちが一杯)。
+      // 失敗しても止めず、次の欠け検出や停滞タイマーでもう一度出す
+      const requestFrom = off => {
+        ++resends;
+        writer.send(cmd(0x01, off)).catch(() => { ++writeErrors; resendAt = -1; });
+      };
+
+      let onValue, onDisconnect, stallTimer;
+      const finished = new Promise((resolve, reject) => {
+        onValue = e => {
+          const v = e.target.value;
+          const off = v.getUint32(0, true);
+          const chunk = new Uint8Array(v.buffer, v.byteOffset + 4, v.byteLength - 4);
+          ++notifies;
+          if (firstOff < 0) firstOff = off;
+          lastOff = off; lastLen = chunk.length;
+          if (off === expected) {
+            buf.set(chunk, off);
+            expected += chunk.length;
+            resendAt = -1;
+            // ack は 4 個ごとと最後だけ (毎回だと上り方向の書き込みが詰まる)
+            if (++sinceAck >= 4 || expected >= total) { writer.ack(expected); sinceAck = 0; }
+            $('bar').value = expected / total;
+            const sec = (performance.now() - t0) / 1000;
+            setStatus(`受信中 ${(expected / 1024).toFixed(0)} / ${(total / 1024).toFixed(0)} KB (${(expected / 1024 / sec).toFixed(1)} KB/s)`);
+            if (expected >= total) resolve();
+          } else if (off < expected) {
+            // 送り直しで来た受信済みの分: ack が落ちていた可能性があるので返し直す
+            writer.ack(expected);
+          } else if (resendAt !== expected) {
+            // 欠けた: そこから送り直してもらう
+            resendAt = expected;
+            requestFrom(expected);
+          }
+        };
+        onDisconnect = () => reject(new Error('切断されました'));
+        // 1.5 秒進まなければそこから送り直してもらい、5 秒進まなければ接続し直す
+        let last = -1, lastProgress = performance.now();
+        stallTimer = setInterval(() => {
+          if (expected !== last) { last = expected; lastProgress = performance.now(); return; }
+          if (expected >= total) return;
+          if (performance.now() - lastProgress > 5000) { reject(new Error('stall')); return; }
+          requestFrom(expected);
+          setStatus(`止まっています: ${diagFn()}`);
+        }, 1500);
+      });
+      data.addEventListener('characteristicvaluechanged', onValue);
+      device.addEventListener('gattserverdisconnected', onDisconnect);
+      try {
+        step = '通知の開始';
+        await data.startNotifications();
+        // 開始要求は届かないと何も始まらないので、失敗したら少し待ってやり直す
+        step = '開始要求';
+        for (let i = 0; ; ++i) {
+          try { await writer.send(cmd(0x01, expected)); break; }
+          catch (e) { if (i >= 4) throw e; await new Promise(r => setTimeout(r, 300)); }
+        }
+        step = '受信';
+        await finished;
+        return writer;
+      } finally {
+        clearInterval(stallTimer);
+        data.removeEventListener('characteristicvaluechanged', onValue);
+        device.removeEventListener('gattserverdisconnected', onDisconnect);
+      }
+    };
+
+    let writer;
+    for (;;) {
+      try {
+        writer = await receiveOnce();
+        break;
+      } catch (e) {
+        // 詰まった・切れた: 受け取り済みの位置から接続し直す (最大 5 回)
+        if (!buf || reconnects >= 5) throw e;
+        ++reconnects;
+        if (device.gatt.connected) device.gatt.disconnect();
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    const sec = (performance.now() - t0) / 1000;
+    step = '復号';
+    setStatus('復号しています…');
+    const files = parseFiles(await decrypt(buf));
+    await writer.send(new Uint8Array([0x02])).catch(() => {});
+    device.gatt.disconnect();
+    setStatus(`${files.length} 枚受け取りました (${(total / 1024).toFixed(0)} KB, ${sec.toFixed(1)} 秒, ${(total / 1024 / sec).toFixed(1)} KB/s, 再送要求 ${resends} 回, 再接続 ${reconnects} 回)`);
+    show(files);
+  } catch (e) {
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    setStatus(e.name === 'NotFoundError' ? '機器が選ばれませんでした。もう一度押してください。' : `失敗しました (${step}): ${e.message}` + (diagFn ? ` / ${diagFn()}` : ''), true);
+    $('go').disabled = false;
+  }
+};
+</script>
+</body>
+</html>
